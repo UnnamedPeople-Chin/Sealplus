@@ -47,6 +47,9 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLDecoder
 import java.util.Locale
 
 object DownloadUtil {
@@ -262,54 +265,174 @@ object DownloadUtil {
     private const val CROP_ARTWORK_PPA =
         """ThumbnailsConvertor+ffmpeg_o:-vf "crop='if(gt(ih,iw),iw,ih)':'if(gt(iw,ih),ih,iw)'""""
 
+    private const val SHORTLINK_USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+    private val SHORTLINK_HOSTS =
+        setOf("pin.it", "api.pinterest.com", "vt.tiktok.com", "vm.tiktok.com", "t.co")
+
+    private val PINTEREST_HOST_REGEX =
+        Regex("""^(?:[a-z0-9-]+\.)*pinterest\.[a-z.]+$""", RegexOption.IGNORE_CASE)
+
+    private val PINTEREST_PIN_PATH_REGEX = Regex("""^/pin/(?:[\w-]+--)?(\d+)""")
+
+    private val PINTEREST_PIN_ANYWHERE_REGEX = Regex("""/pin/(?:[\w-]+--)?(\d+)""")
+
+    private val PINTEREST_LOGIN_ERROR_REGEX =
+        Regex(
+            """https?://[^\s'"]*pinterest\.[^\s'"]*/login/\?[^\s'"]*next=([^\s&'"]+)""",
+            RegexOption.IGNORE_CASE,
+        )
+
+    private fun canonicalizePinterestUrl(url: String): String {
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return url
+        val host = uri.host?.lowercase(Locale.ROOT) ?: return url
+        if (!PINTEREST_HOST_REGEX.matches(host)) return url
+        val path = uri.path ?: return url
+        if (path.startsWith("/login")) {
+            val next = uri.getQueryParameter("next")
+            val pinId = next?.let { PINTEREST_PIN_ANYWHERE_REGEX.find(it)?.groupValues?.get(1) }
+            if (pinId != null) {
+                return "https://www.pinterest.com/pin/$pinId/"
+            }
+        }
+        val match = PINTEREST_PIN_PATH_REGEX.find(path) ?: return url
+        return "https://www.pinterest.com/pin/${match.groupValues[1]}/"
+    }
+
+    private fun normalizeInputUrl(rawUrl: String): String {
+        val trimmed = rawUrl.trim()
+        if (trimmed.isEmpty()) return trimmed
+        val preCanonical = canonicalizePinterestUrl(trimmed)
+        if (preCanonical != trimmed) return preCanonical
+
+        var current = trimmed
+        repeat(5) {
+            val canonical = canonicalizePinterestUrl(current)
+            if (canonical != current) return canonical
+
+            val uri = runCatching { Uri.parse(current) }.getOrNull() ?: return current
+            val host = uri.host?.lowercase(Locale.ROOT) ?: return current
+            if (host !in SHORTLINK_HOSTS) return current
+
+            val nextLocation =
+                runCatching {
+                    val conn =
+                        (URL(current).openConnection() as HttpURLConnection).apply {
+                            instanceFollowRedirects = false
+                            requestMethod = "GET"
+                            connectTimeout = 5_000
+                            readTimeout = 5_000
+                            setRequestProperty("User-Agent", SHORTLINK_USER_AGENT)
+                        }
+                    try {
+                        if (conn.responseCode in 300..399) {
+                            conn.getHeaderField("Location")?.let { location ->
+                                URL(URL(current), location).toString()
+                            }
+                        } else {
+                            null
+                        }
+                    } finally {
+                        conn.disconnect()
+                    }
+                }.getOrNull() ?: return current
+
+            if (nextLocation == current) return current
+            current = nextLocation
+        }
+        return canonicalizePinterestUrl(current)
+    }
+
+    private fun extractPinterestCanonicalUrlFromError(throwable: Throwable): String? {
+        val message =
+            listOfNotNull(throwable.message, throwable.cause?.message).joinToString("\n")
+        val rawNext = PINTEREST_LOGIN_ERROR_REGEX.find(message)?.groupValues?.get(1) ?: return null
+        var decodedNext = rawNext
+        // Decode up to twice so single- and double-encoded `next` query parameters both recover.
+        repeat(2) {
+            decodedNext =
+                runCatching { URLDecoder.decode(decodedNext, "UTF-8") }.getOrDefault(decodedNext)
+            val pinId = PINTEREST_PIN_ANYWHERE_REGEX.find(decodedNext)?.groupValues?.get(1)
+            if (pinId != null) {
+                return "https://www.pinterest.com/pin/$pinId/"
+            }
+        }
+        return null
+    }
+
+    private fun resolveVideoDownloadUrl(videoInfo: VideoInfo): String? {
+        val candidate =
+            videoInfo.webpageUrl?.takeIf { it.isNotBlank() }
+                ?: videoInfo.originalUrl?.takeIf { it.isNotBlank() }
+                ?: return null
+        return canonicalizePinterestUrl(candidate)
+    }
+
+    private fun executePlaylistOrVideoInfo(
+        url: String,
+        processId: String,
+        downloadPreferences: DownloadPreferences,
+    ): YoutubeDLInfo {
+        val request = YoutubeDLRequest(url)
+        with(request) {
+            //            addOption("--compat-options", "no-youtube-unavailable-videos")
+            addOption("--flat-playlist")
+            addOption("--dump-single-json")
+            addOption("-o", BASENAME)
+            // Info-probe resilience: 1 retry + 5s timeout was too aggressive and made
+            // slow/distant servers (common for many non-YouTube sites) fail to even
+            // fetch metadata. 3 retries + 15s timeout is far more tolerant while still
+            // failing reasonably fast on genuinely dead hosts.
+            addOption("-R", "3")
+            addOption("--socket-timeout", "15")
+            enableQuickJsIfAvailable()
+            downloadPreferences.run {
+                if (extractAudio) {
+                    addOption("-x")
+                }
+                applyFormatSorter(this, toFormatSorter())
+                if (forceIpv4) {
+                    addOption("-4")
+                }
+                if (noCheckCertificate) {
+                    addOption("--no-check-certificate")
+                }
+                if (cookies) {
+                    enableCookies(userAgentString)
+                }
+                if (restrictFilenames) {
+                    addOption("--restrict-filenames")
+                }
+            }
+        }
+        return YoutubeDL.getInstance().execute(request, processId).out.run {
+            val playlistInfo = jsonFormat.decodeFromString<PlaylistResult>(this)
+            if (playlistInfo.type != "playlist") {
+                jsonFormat.decodeFromString<VideoInfo>(this)
+            } else playlistInfo
+        }
+    }
+
     @CheckResult
     fun getPlaylistOrVideoInfo(
         playlistURL: String,
         downloadPreferences: DownloadPreferences = DownloadPreferences.createFromPreferences(),
-    ): Result<YoutubeDLInfo> =
-        YoutubeDL.runCatching {
-            App.applicationScope.launch(Dispatchers.Main) {
-                context.makeToast(R.string.fetching_playlist_info)
-            }
-            val request = YoutubeDLRequest(playlistURL)
-            with(request) {
-                //            addOption("--compat-options", "no-youtube-unavailable-videos")
-                addOption("--flat-playlist")
-                addOption("--dump-single-json")
-                addOption("-o", BASENAME)
-                // Info-probe resilience: 1 retry + 5s timeout was too aggressive and made
-                // slow/distant servers (common for many non-YouTube sites) fail to even
-                // fetch metadata. 3 retries + 15s timeout is far more tolerant while still
-                // failing reasonably fast on genuinely dead hosts.
-                addOption("-R", "3")
-                addOption("--socket-timeout", "15")
-                enableQuickJsIfAvailable()
-                downloadPreferences.run {
-                    if (extractAudio) {
-                        addOption("-x")
-                    }
-                    applyFormatSorter(this, toFormatSorter())
-                    if (forceIpv4) {
-                        addOption("-4")
-                    }
-                    if (noCheckCertificate) {
-                        addOption("--no-check-certificate")
-                    }
-                    if (cookies) {
-                        enableCookies(userAgentString)
-                    }
-                    if (restrictFilenames) {
-                        addOption("--restrict-filenames")
-                    }
-                }
-            }
-            execute(request, playlistURL).out.run {
-                val playlistInfo = jsonFormat.decodeFromString<PlaylistResult>(this)
-                if (playlistInfo.type != "playlist") {
-                    jsonFormat.decodeFromString<VideoInfo>(this)
-                } else playlistInfo
-            }
+    ): Result<YoutubeDLInfo> {
+        App.applicationScope.launch(Dispatchers.Main) {
+            context.makeToast(R.string.fetching_playlist_info)
         }
+        val resolvedUrl = normalizeInputUrl(playlistURL)
+        return YoutubeDL.runCatching {
+            executePlaylistOrVideoInfo(resolvedUrl, playlistURL, downloadPreferences)
+        }.recoverCatching { throwable ->
+            val canonicalUrl =
+                extractPinterestCanonicalUrlFromError(throwable)
+                    ?.takeIf { it != resolvedUrl }
+                    ?: throw throwable
+            executePlaylistOrVideoInfo(canonicalUrl, playlistURL, downloadPreferences)
+        }
+    }
 
     @CheckResult
     private fun getVideoInfo(
@@ -329,6 +452,33 @@ object DownloadUtil {
         playlistIndex: Int? = null,
         taskKey: String? = null,
         preferences: DownloadPreferences = DownloadPreferences.createFromPreferences(),
+    ): Result<VideoInfo> {
+        val resolvedUrl = normalizeInputUrl(url)
+        return fetchVideoInfoFromResolvedUrl(
+            url = resolvedUrl,
+            playlistIndex = playlistIndex,
+            taskKey = taskKey,
+            preferences = preferences,
+        ).recoverCatching { throwable ->
+            val canonicalUrl =
+                extractPinterestCanonicalUrlFromError(throwable)
+                    ?.takeIf { it != resolvedUrl }
+                    ?: throw throwable
+            fetchVideoInfoFromResolvedUrl(
+                url = canonicalUrl,
+                playlistIndex = playlistIndex,
+                taskKey = taskKey,
+                preferences = preferences,
+            ).getOrThrow()
+        }
+    }
+
+    @CheckResult
+    private fun fetchVideoInfoFromResolvedUrl(
+        url: String,
+        playlistIndex: Int? = null,
+        taskKey: String? = null,
+        preferences: DownloadPreferences,
     ): Result<VideoInfo> {
         with(preferences) {
             // Build the request inside runCatching so that any exception thrown during
@@ -1202,13 +1352,14 @@ object DownloadUtil {
 
         with(downloadPreferences) {
             val url =
-                playlistUrl.ifEmpty {
-                    videoInfo.originalUrl
-                        ?: videoInfo.webpageUrl
-                        ?: return Result.failure(
-                            Throwable(context.getString(R.string.fetch_info_error_msg))
-                        )
-                }
+                canonicalizePinterestUrl(
+                    playlistUrl.ifEmpty {
+                        resolveVideoDownloadUrl(videoInfo)
+                            ?: return Result.failure(
+                                Throwable(context.getString(R.string.fetch_info_error_msg))
+                            )
+                    }
+                )
             val request = YoutubeDLRequest(url)
             val pathBuilder = StringBuilder()
             val outputBuilder = StringBuilder()

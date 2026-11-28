@@ -5,6 +5,14 @@ All notable changes (starting from v1.7.3) to stable releases will be documented
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.1] - 2026-11-28
+
+### 🐛 Bug Fixes
+- **Pinterest Shortlink & Login Redirect Recovery**:
+  - Canonicalize Pinterest `/pin/<id>/sent/...` URLs and resolve shortlinks (`pin.it`, `vt.tiktok.com`, `vm.tiktok.com`, `t.co`) once upfront so Share-sheet links no longer hit rate-limited invite URLs multiple times.
+  - Prefer canonical `webpageUrl` over raw shortlink `originalUrl` in `downloadVideo()`, eliminating redundant shortlink lookups during download.
+  - Automatically recover from `pinterest.com/login/?next=/pin/...` rate-limit redirects by extracting the canonical `/pin/<id>/` URL from the error message and retrying cleanly.
+
 ## [3.2.0] - 2026-11-28
 
 ### 🌐 Platform Extractors & Browser Impersonation
