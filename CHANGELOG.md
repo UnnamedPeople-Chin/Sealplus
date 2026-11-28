@@ -5,6 +5,21 @@ All notable changes (starting from v1.7.3) to stable releases will be documented
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-11-28
+
+### 🌐 Platform Extractors & Browser Impersonation
+
+* **Bundled Python 3.14 & `curl-cffi`** — Enables TLS/browser impersonation for platforms like TikTok, Instagram, X/Twitter, and Facebook
+* **QuickJS Runtime Integration** — Automatically passes `--js-runtimes quickjs` (`libqjs.so`) so YouTube Music and JS-protected extractors resolve formats reliably
+
+### ⚡ Quick Download, Queue & Artwork Fixes
+
+* **Quick Download Background Reliability** — Keeps `DownloadService` foreground promotion and wake lock active across `Idle`, `FetchingInfo`, `ReadyWithInfo`, and `Running` states, awaits native library initialization on cold start, handles `singleInstance` `onNewIntent()`, and adds jittered auto-retry for transient `fetchInfo` and TikTok WAF 403 errors
+* **Crash & Queue Persistence (#36)** — Replaced fatal `check()` assertions on manual retry with safe guards, kept unfinished queues across restarts, and added ProGuard/R8 rules for `@Serializable` download states
+* **Clear All on Home (#37)** — Added a Clear All action with confirmation dialog to the "Recent downloads" header while preserving active/retained temp files
+* **Music Artwork Cropping (#38)** — Scoped `1:1` square artwork cropping strictly to `ThumbnailsConvertor` and unlocked the Crop artwork & Embed metadata toggles for per-video Audio selections
+* **Better Error Visibility** — Clickable error notifications now show an expanded error summary (`BigTextStyle`), and failed cards on Home expose "Copy error report"
+
 ## [3.1.0] - 2026-10-13
 
 ### 🔁 Retry All & Download Queue Recovery
